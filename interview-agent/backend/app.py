@@ -171,7 +171,7 @@ async def upload_resume(file: UploadFile = File(...)):
     if row:
         conn.close()
         return {"resume_id": row["id"], "filename": row["filename"],
-                "preview": text[:500], "reused": True}
+                "preview": text, "raw_text": text, "reused": True}
     cur = conn.execute(
         "INSERT INTO resumes (content_hash, filename, raw_text, created_at) VALUES (?,?,?,?)",
         (h, file.filename, text, now_iso()),
@@ -179,7 +179,7 @@ async def upload_resume(file: UploadFile = File(...)):
     conn.commit()
     rid = cur.lastrowid
     conn.close()
-    return {"resume_id": rid, "filename": file.filename, "preview": text[:500], "reused": False}
+    return {"resume_id": rid, "filename": file.filename, "preview": text, "raw_text": text, "reused": False}
 
 
 @app.get("/api/resume/latest")
@@ -189,7 +189,7 @@ def latest_resume():
     conn.close()
     if not row:
         return None
-    return {"resume_id": row["id"], "filename": row["filename"], "preview": row["raw_text"][:500]}
+    return {"resume_id": row["id"], "filename": row["filename"], "preview": row["raw_text"], "raw_text": row["raw_text"]}
 
 
 # ----------------------------- 面试 -----------------------------
