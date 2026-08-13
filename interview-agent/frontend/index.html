@@ -550,7 +550,7 @@
         <h3>对话式修改 / 追加问题</h3>
       </div>
       <div id="chatHistory" class="chat-log" aria-live="polite"></div>
-      <textarea id="chatInput" placeholder="如：再追加 2 道关于 Redis 缓存击穿的题；把第 3 题改得更难；删除第 2 题…"></textarea>
+      <textarea id="chatInput" placeholder="例如：把现有题目都改成 AI/RAG 方向；再追加 10 道与 Transformer 相关的题；把第 3 题改得更难；删除第 2 题…"></textarea>
       <div class="row" style="margin-top:10px">
         <button class="btn" id="chatSend">发送</button>
         <span class="muted" id="chatStatus" aria-live="polite"></span>
@@ -1255,7 +1255,11 @@ $('#chatSend').onclick=async()=>{
   }catch(e){ busyBtn(btn,false); $('#chatStatus').textContent=''; chatLog.pop(); renderChat(); toast('出错（服务端未启动或模型超时）','err'); }
 };
 $('#chatInput').addEventListener('keydown',e=>{
-  if((e.ctrlKey||e.metaKey)&&e.key==='Enter') $('#chatSend').click();
+  // 回车直接发送；Shift+回车换行；Ctrl/Cmd+回车也发送（兼容旧习惯）
+  if(e.key==='Enter' && !e.shiftKey){
+    e.preventDefault();
+    if($('#chatInput').value.trim()) $('#chatSend').click();
+  }
 });
 
 /* ================= 编辑 ================= */
