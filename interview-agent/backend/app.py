@@ -138,16 +138,19 @@ def _row_to_dict(row):
 
 def _apply_diff(questions, diff):
     qs = [dict(q) for q in questions]
+    # 支持单 action 或 mixed；允许 deleted/updated/added 同时存在
     for did in diff.get("deleted") or []:
         qs = [q for q in qs if q["id"] != did]
     for u in diff.get("updated") or []:
         for q in qs:
             if q["id"] == u.get("id"):
-                q.update({k: v for k, v in u.get("patch", {}).items()})
-    for a in diff.get("added") or []:
+                q.update({k: v for k, v in u.get("patch", {}).items() if k != "id"})
+    # 先按可能已有的 id 排序，再统一重排，保证最终顺序与 LLM 返回顺序一致
+    added_raw = diff.get("added") or []
+    for a in added_raw:
         na = dict(a)
-        max_id = max([q["id"] for q in qs], default=0)
-        na["id"] = max_id + 1
+        na.pop("id", None)
+        na["id"] = max([q["id"] for q in qs], default=0) + 1
         qs.append(na)
     return qs
 
@@ -323,8 +326,17 @@ async def chat_modify(iid: int, body: ChatReq):
     if not row:
         conn.close()
         raise HTTPException(404, "面试记录不存在")
+    # 联表取简历原文，让修改/追加题有完整上下文
+    resume_text = ""
+    if row["resume_id"]:
+        rrow = conn.execute("SELECT raw_text FROM resumes WHERE id=?", (row["resume_id"],)).fetchone()
+        if rrow:
+            resume_text = rrow["raw_text"] or ""
     current = {
         "company": row["company"],
+        "jd": row["jd"] or "",
+        "knowledge_base": row["knowledge_base"] or "",
+        "resume_text": resume_text,
         "alignment": json.loads(row["alignment"] or "[]"),
         "questions": json.loads(row["questions"] or "[]"),
     }
