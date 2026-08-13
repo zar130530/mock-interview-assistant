@@ -2,6 +2,7 @@
 前端可传入 api_key/base_url/model，优先级高于环境变量；无 key 时回退 Mock。
 """
 import os
+import re
 import json
 import logging
 from openai import OpenAI
@@ -31,8 +32,14 @@ def _resolve(api_key, base_url, model):
     )
 
 
+# 单次 LLM 调用的最长等待（秒）。略小于 app.py 里 run_blocking 的 120，
+# 这样“模型不可达/生成卡死”时由客户端先超时，异常被 chat_modify 捕获为友好 502，
+# 而不是让线程挂到 OpenAI 默认 600s 超时。正常 DeepSeek 深度生成 90s 内可返回。
+LLM_TIMEOUT = float(os.getenv("LLM_TIMEOUT", "110"))
+
+
 def _client(api_key, base_url):
-    return OpenAI(api_key=api_key or "EMPTY", base_url=base_url)
+    return OpenAI(api_key=api_key or "EMPTY", base_url=base_url, timeout=LLM_TIMEOUT)
 
 
 def _extract_json(text: str):
@@ -82,10 +89,12 @@ def generate_interview(resume_text, jd, company, knowledge_base="", api_key=None
 
 def modify_interview(current_state, instruction, api_key=None, base_url=None, model=None):
     api_key, base_url, model = _resolve(api_key, base_url, model)
+    # 为修改/追加题重新检索算法题候选，避免模型编造
+    retrieved = search_questions(current_state.get("jd", ""), current_state.get("resume_text", ""), k=6)
     if MOCK or not api_key:
-        return mock_modify(current_state, instruction)
+        return mock_modify(current_state, instruction, retrieved)
     client = _client(api_key, base_url)
-    user = build_modify_user_prompt(current_state, instruction)
+    user = build_modify_user_prompt(current_state, instruction, retrieved)
     return _chat(client, model, MODIFY_SYSTEM_PROMPT, user)
 
 
@@ -249,15 +258,145 @@ def _mock_algo_answer(retrieved):
             "能否降低一维）并延伸一两个变式，展示对这类题型的系统掌握。")
 
 
-def mock_modify(current_state, instruction):
-    qs = current_state.get("questions", [])
-    max_id = max([q["id"] for q in qs], default=0)
-    added = [{
-        "id": max_id + 1,
-        "category": "追加题",
-        "question": f"（Mock 追加）围绕你的指令「{instruction[:40]}」出一道追问。",
-        "answer": "（Mock）参考回答要点。",
-        "focus": "指令相关",
-        "scoring": "优秀/合格/不合格三档。",
-    }]
-    return {"action": "append", "added": added, "updated": [], "deleted": [], "reply": "（Mock）已按你的指令追加 1 道题。"}
+def mock_modify(current_state, instruction, retrieved=None):
+    """无真实模型时的规则化对话修改：支持改/删/批量追加，尽量贴合 resume/jd/主题。
+    接入真实模型后本函数不再被调用。"""
+    import re
+
+    qs = [dict(q) for q in current_state.get("questions", [])]
+    company = current_state.get("company", "目标公司")
+    jd = current_state.get("jd", "") or ""
+    resume_text = current_state.get("resume_text", "") or ""
+    kb = current_state.get("knowledge_base", "") or ""
+    ins = instruction.strip()
+    lowered = ins.lower()
+
+    # 提取题号 / 数量
+    nums = [int(n) for n in re.findall(r"第\s*(\d+)\s*[题道个]", ins) if int(n) > 0]
+    if not nums:
+        nums = [int(n) for n in re.findall(r"(\d+)", ins) if 0 < int(n) <= 30]
+
+    # 操作意图
+    is_delete = any(k in lowered for k in ["删", "不要", "去掉", "移除"])
+    append_kws = ["追加", "新增", "再来", "生成", "多出", "增加", "添加"]
+    update_kws = ["改", "替换", "变成", "换成", "调整", "方向", "相关", "改成", "改为",
+                "有关", "围绕", "贴合", "聚焦", "偏向", "都要", "应该", "全部", "都", "所有", "每道", "现有"]
+    is_append = any(k in lowered for k in append_kws)
+    # 若未明确追加/新增，但出现"相关/围绕/都要/应该/都"等倾向，则视为要求修改现有题目
+    is_update = (not is_append) and any(k in lowered for k in update_kws)
+
+    # 主题关键词
+    topic_kw = ""
+    topic_map = [
+        (["ai", "人工智能", "智能体", "agent", "llm", "大模型"], "AI/大模型/智能体"),
+        (["rag", "检索增强"], "RAG/检索增强"),
+        (["transformer", "bert", "gpt"], "Transformer/GPT/BERT"),
+        (["算法", "leetcode", "力扣", "coding"], "算法"),
+        (["redis", "缓存"], "Redis/缓存"),
+        (["mysql", "数据库", "sql"], "MySQL/数据库"),
+        (["go", "golang"], "Go"),
+        (["python"], "Python"),
+        (["k8s", "kubernetes", "docker", "容器"], "云原生/容器"),
+    ]
+    for keys, label in topic_map:
+        if any(k in lowered for k in keys):
+            topic_kw = label
+            break
+
+    # 若指令有实际意义但没有匹配到操作词，默认追加
+    if not is_delete and not is_update and not is_append:
+        is_append = True
+
+    # 追加数量：默认 1；明确说 N 题/十/10 则取 N；说"几题/一些/多来"则给 5
+    count = 1
+    m_count = re.search(r"(\d+)\s*[题道个]", ins)
+    if m_count:
+        count = max(1, min(int(m_count.group(1)), 15))
+    elif "十" in ins or "10" in ins:
+        count = 10
+    elif is_append and any(k in lowered for k in ["几题", "几道题", "一些题", "多来", "多几道"]):
+        count = 5
+
+    deleted = []
+    if is_delete:
+        deleted = [qs[n - 1]["id"] for n in nums if 0 < n <= len(qs)]
+        for qid in deleted:
+            qs = [q for q in qs if q["id"] != qid]
+
+    # 用 mock_generate 重新生成一批完整题目作为修改/追加素材
+    generated = mock_generate(resume_text, jd, company, kb, retrieved).get("questions", [])
+
+    updated = []
+    if is_update:
+        # "都/全部/所有" 且没有具体题号 -> 更新全部
+        if any(k in lowered for k in ["全部", "都", "所有", "每道"]) or not nums:
+            nums = list(range(1, len(qs) + 1))
+        for n in nums:
+            if n <= len(qs):
+                gq = generated[(n - 1) % len(generated)] if generated else None
+                if gq:
+                    patch = {
+                        "question": _mock_topic_rewrite(gq["question"], company, topic_kw),
+                        "answer": _mock_topic_rewrite(gq["answer"], company, topic_kw),
+                        "focus": gq["focus"],
+                        "scoring": gq["scoring"],
+                        "category": gq["category"],
+                    }
+                    updated.append({"id": qs[n - 1]["id"], "patch": patch})
+
+    added = []
+    if is_append:
+        for i in range(count):
+            gq = generated[i % len(generated)] if generated else _mock_fallback_question(company, topic_kw, i)
+            newq = dict(gq)
+            if topic_kw:
+                newq["question"] = _mock_topic_rewrite(newq["question"], company, topic_kw)
+                newq["answer"] = _mock_topic_rewrite(newq["answer"], company, topic_kw)
+                if topic_kw == "算法":
+                    newq["category"] = "纯算法"
+            added.append(newq)
+
+    action = "mixed" if (updated and added) or (updated and deleted) or (added and deleted) else (
+        "update" if updated else ("delete" if deleted else "append")
+    )
+
+    reply_parts = []
+    if updated:
+        reply_parts.append(f"已修改 {len(updated)} 道题为{topic_kw or '贴合要求'}方向")
+    if added:
+        reply_parts.append(f"已追加 {len(added)} 道题")
+    if deleted:
+        reply_parts.append(f"已删除 {len(deleted)} 道题")
+
+    return {
+        "action": action,
+        "added": added,
+        "updated": updated,
+        "deleted": deleted,
+        "reply": "；".join(reply_parts) if reply_parts else "已按指令调整题目"
+    }
+
+
+def _mock_topic_rewrite(text, company, topic_kw):
+    """简单把通用题干向用户指定的主题迁移，Mock 阶段有限规则。"""
+    if not topic_kw:
+        return text
+    if "岗位" in text or "公司" in text:
+        text = re.sub(r"当前项目|当前岗位|这个项目", f"{company} 的业务场景", text)
+    # 把"某项技术"替换得更具体
+    if "某项技术" in text or "一项技术" in text:
+        text = text.replace("某项技术", topic_kw).replace("一项技术", topic_kw)
+    return f"【{topic_kw}】{text}"
+
+
+def _mock_fallback_question(company, topic_kw, idx):
+    """当完全无简历/JD 时的兜底题目。"""
+    return {
+        "category": "基础技术",
+        "question": f"请结合 {company} 的业务场景，谈谈你对 {topic_kw or '该技术方向'} 的理解与实际运用思路。",
+        "answer": (f"结论先行：{topic_kw or '该技术方向'} 的核心价值在于解决具体业务问题。"
+                   "我会先讲清它的工作原理与适用边界，再结合过往项目说明选型理由、落地过程与踩坑经验，"
+                   "最后用可量化的指标说明效果。"),
+        "focus": "技术理解深度与迁移能力",
+        "scoring": "优秀：原理清晰且有真实案例；合格：概念正确；不合格：答非所问。"
+    }
