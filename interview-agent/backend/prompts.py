@@ -46,16 +46,31 @@ INTERVIEWER_SYSTEM_PROMPT = """你是一位拥有多年经验的资深技术面�
 }
 """
 
-MODIFY_SYSTEM_PROMPT = """你在修改一份已生成的面试提纲。用户会给出自然语言指令。
-请仅返回需要变更的部分，严格使用如下 JSON：
+MODIFY_SYSTEM_PROMPT = """你正在修改一份已生成的技术面试提纲。用户会通过自然语言指令要求你调整题目。
+
+# 重要原则：已生成的题目不是不可修改的
+- 当用户说"改成XX方向/与XX有关/贴合XX公司/都改成AI相关"时，你应当 **update 现有题目**（改写题干、answer、focus、scoring），而不是只 append 一道新题敷衍。
+- 当用户说"再追加/再来/再生成 N 道题"时，你应当 append N 道完整新题。
+- 当用户说"删除第 X 题/不要第 X 题"时，使用 delete。
+- 一次响应可以同时包含 update + append + delete（action 用 "mixed"）。
+
+# 新增/修改题目的质量要求（与初始生成完全一致）
+1. 所有题目必须从「候选人简历」与「JD要求」中找依据；若用户要求贴合新业务方向（如 AI），也要尽量迁移简历中的相关经历。
+2. 标准答案 answer 必须写成 150~300 字完整回答稿，第一人称、可直接背诵，结构：结论先行 → 分层展开 → 结合自身经历收尾。
+3. 若新增或修改算法题，必须从「力扣题库候选」中挑选真实题目，题干注明力扣题号与标题，category 固定为「纯算法」。
+4. 新增多题时，建议按 基础技术:实习项目深挖:行为软素质:纯算法 ≈ 4:3:2:1 分配；category 不允许用「追加题」这种无意义占位符。
+5. 严禁只返回"围绕你的指令出一道追问"这类模板题干；必须给出真实、具体、可回答的面试题。
+
+# 输出格式
+严格返回 JSON，不要额外寒暄：
 {
-  "action": "append" | "update" | "delete",
-  "added": [新增题目对象，可带临时字段，后端重排 id],
-  "updated": [{"id":<原id>,"patch":{可含 question/answer/focus/scoring 任意字段}}],
-  "deleted": [<id>, ...],
-  "reply": "用一句话向用户说明你做了什么改动"
+  "action": "mixed",
+  "added": [新增题目对象数组，id 可临时，后端会重排；必须含 category/question/answer/focus/scoring],
+  "updated": [{"id":<原题id>,"patch":{"question":"...","answer":"...","focus":"...","scoring":"...","category":"..."}}],
+  "deleted": [<原题id>, ...],
+  "reply": "用一句话向用户说明具体改了哪些题、追加了多少道"
 }
-不要返回未改动题目的完整内容。题目须保持面试官口吻、含 answer/focus/scoring。"""
+不要返回未改动题目的完整内容。"""
 
 
 def build_interview_user_prompt(resume_text, jd, company, knowledge_base="", retrieved=None):
@@ -85,13 +100,49 @@ def build_interview_user_prompt(resume_text, jd, company, knowledge_base="", ret
 请按系统提示输出 JSON（company/position/alignment/questions）。候选人已通过初筛，聚焦面试深度问答。"""
 
 
-def build_modify_user_prompt(current_state, instruction):
-    return f"""当前提纲（JSON）：
-{json.dumps(current_state, ensure_ascii=False)}
+def build_modify_user_prompt(current_state, instruction, retrieved=None):
+    company = current_state.get("company", "目标公司")
+    jd = current_state.get("jd", "") or ""
+    kb = current_state.get("knowledge_base", "") or ""
+    resume_text = current_state.get("resume_text", "") or ""
+    questions = current_state.get("questions", []) or []
 
-用户指令：{instruction}
+    kb_block = f"\n# 岗位知识库 / 补充背景\n{kb[:600]}\n" if kb else ""
+    rag_block = ""
+    if retrieved:
+        lines = []
+        for q in retrieved:
+            lines.append(
+                f"- 力扣第 {q['no']} 题 · {q['title']}（{q['difficulty']}）｜"
+                f"标签：{','.join(q['tags'])}｜题目：{q['desc']}｜示例：{q['examples']}｜思路提示：{q['hint']}"
+            )
+        rag_block = (
+            "\n# 力扣题库（RAG 检索候选）—— 若新增或修改算法题必须从中选题，严禁编造\n"
+            + "\n".join(lines)
+            + "\n"
+        )
 
-请仅返回变更增量 JSON（action/added/updated/deleted/reply）。"""
+    q_block = "\n".join(
+        f"- id={q.get('id')} [{q.get('category', '综合')}] {q.get('question', '')[:140]}"
+        for q in questions
+    )
+
+    return f"""# 目标公司
+{company}
+
+# 招聘要求（JD）
+{jd[:1200] if jd else '（未提供）'}
+{kb_block}{rag_block}
+# 候选人简历（节选）
+{resume_text[:1800] if resume_text else '（未提供）'}
+
+# 当前题目列表
+{q_block if q_block else '（暂无题目）'}
+
+# 用户指令
+{instruction}
+
+请按系统提示返回变更增量 JSON（action/added/updated/deleted/reply）。"""
 
 
 def build_grade_user_prompt(question, user_answer):
