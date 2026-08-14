@@ -1,0 +1,22 @@
+services:
+  - type: web
+    name: interview-assistant
+    runtime: python
+    plan: free
+    branch: main
+    region: oregon
+    rootDir: interview-agent/backend
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn app:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /
+    envVars:
+      - key: PYTHON_VERSION
+        value: "3.11"
+      - key: LLM_API_KEY
+        sync: false
+      - key: LLM_BASE_URL
+        sync: false
+      - key: LLM_MODEL
+        sync: false
+      - key: MOCK
+        value: "0"
